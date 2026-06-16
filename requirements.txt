@@ -4,3 +4,5 @@ openpyxl
 pymupdf
 google-generativeai
 python-dotenv
+Pyrebase4
+stripe

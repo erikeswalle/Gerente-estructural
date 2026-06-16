@@ -10,10 +10,11 @@ import google.generativeai as genai
 from dotenv import load_dotenv, set_key
 import io
 import shutil
-import tkinter as tk
-from tkinter import filedialog
 import numpy as np
+import zipfile
 from PIL import Image, ImageOps
+import pyrebase
+import stripe
 
 # Cargar variables de entorno
 load_dotenv()
@@ -23,6 +24,129 @@ st.set_page_config(page_title="Auditor QA/QC ITIFE", page_icon="🏗️", layout
 
 # Título Principal
 st.title("🏗️ Sistema de Auditoría Estructural y QA/QC")
+
+# ==========================================
+# MÓDULO DE AUTENTICACIÓN (FIREBASE)
+# ==========================================
+firebaseConfig = {
+  "apiKey": "AIzaSyCkWdtHqfYEPjrHORGn7D3juCprD2COFxk",
+  "authDomain": "gerente-estructural.firebaseapp.com",
+  "projectId": "gerente-estructural",
+  "storageBucket": "gerente-estructural.firebasestorage.app",
+  "messagingSenderId": "354825313447",
+  "appId": "1:354825313447:web:c9fd2a5b3c0021a83ccf82",
+  "measurementId": "G-FCKH3TRK0S",
+  "databaseURL": "https://gerente-estructural-default-rtdb.firebaseio.com/"
+}
+
+# Inicializar Firebase
+firebase = pyrebase.initialize_app(firebaseConfig)
+auth = firebase.auth()
+
+if 'user' not in st.session_state:
+    st.session_state['user'] = None
+
+if st.session_state['user'] is None:
+    st.subheader("🔐 Acceso Restringido")
+    st.markdown("Por favor, inicia sesión o crea una cuenta para acceder a la herramienta.")
+    
+    col_login, col_empty = st.columns([1, 1])
+    with col_login:
+        auth_mode = st.radio("Elige una opción:", ["Iniciar Sesión", "Registrarse"], horizontal=True)
+        email = st.text_input("Correo electrónico")
+        password = st.text_input("Contraseña", type="password")
+        
+        if auth_mode == "Iniciar Sesión":
+            if st.button("🚪 Entrar", use_container_width=True):
+                if not email or not password:
+                    st.warning("Ingresa correo y contraseña.")
+                else:
+                    with st.spinner("Autenticando..."):
+                        try:
+                            user = auth.sign_in_with_email_and_password(email, password)
+                            st.session_state['user'] = user
+                            st.rerun()
+                        except Exception as e:
+                            st.error("Credenciales inválidas o usuario no encontrado.")
+        else:
+            if st.button("📝 Crear Cuenta", use_container_width=True):
+                if not email or not password:
+                    st.warning("Ingresa correo y contraseña.")
+                else:
+                    with st.spinner("Creando cuenta..."):
+                        try:
+                            user = auth.create_user_with_email_and_password(email, password)
+                            st.success("✅ Cuenta creada exitosamente. Ahora puedes Iniciar Sesión.")
+                        except Exception as e:
+                            st.error(f"Error al crear cuenta. La contraseña debe tener al menos 6 caracteres y el correo ser válido.")
+    
+    st.stop() # Detiene la ejecución del resto de la app hasta que haya login exitoso
+
+# ==========================================
+# APP PRINCIPAL (USUARIOS LOGUEADOS)
+# ==========================================
+st.sidebar.success(f"Logueado como: {st.session_state['user'].get('email', 'Usuario')}")
+if st.sidebar.button("Cerrar Sesión"):
+    st.session_state['user'] = None
+    st.rerun()
+
+# --- Integración Stripe y Base de Datos ---
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+db = firebase.database()
+uid = st.session_state['user']['localId']
+
+# 1. Verificar si viene de un pago exitoso (Redirección de Stripe)
+if "session_id" in st.query_params:
+    session_id = st.query_params["session_id"]
+    try:
+        checkout_session = stripe.checkout.Session.retrieve(session_id)
+        if checkout_session.payment_status == "paid":
+            # Actualizar DB: el usuario es premium
+            db.child("users").child(uid).update({"is_premium": True})
+            st.success("✅ ¡Pago confirmado! Gracias por tu suscripción.")
+            st.balloons()
+    except Exception as e:
+        st.error("Error al verificar el pago con Stripe.")
+
+# 2. Leer estado de suscripción del usuario desde Firebase
+user_data = db.child("users").child(uid).get().val()
+is_premium = False
+if user_data and user_data.get("is_premium"):
+    is_premium = True
+
+# 3. Bloqueo (Muro de Pago)
+if not is_premium:
+    st.error("🔒 Tu cuenta no tiene una suscripción activa.")
+    st.markdown("Para utilizar el motor de Inteligencia Artificial y procesar tus planos, necesitas una membresía Pro.")
+    
+    # Crear sesión de Stripe en tiempo real
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'mxn',
+                    'product_data': {
+                        'name': 'Gerente Estructural Pro (Mensual)',
+                        'description': 'Acceso ilimitado al motor de revisión automatizada.'
+                    },
+                    'unit_amount': 49900, # $499.00 MXN
+                    'recurring': {'interval': 'month'}
+                },
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url='https://app.aura-workspace.com/?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url='https://app.aura-workspace.com/',
+            client_reference_id=uid
+        )
+        st.link_button("💳 Proceder al Pago Seguro ($499 MXN/mes)", session.url, type="primary")
+    except Exception as e:
+        st.error(f"No se pudo conectar con el banco: {e}")
+        
+    st.stop() # Bloquea el resto de la aplicación
+
+# --- Resto de la aplicación desbloqueada ---
 st.markdown("""
 Esta herramienta cruza información de Planos Estructurales (PDF) y Catálogos/Generadores (Excel) 
 para detectar discrepancias e incumplimientos normativos usando Inteligencia Artificial.
@@ -39,32 +163,12 @@ with st.sidebar.expander("⚙️ Configuración Avanzada", expanded=False):
         set_key(".env", "GEMINI_API_KEY", api_key)
         st.caption("✅ API Key guardada en automático para futuras sesiones.")
 st.sidebar.markdown("---")
-modulo_activo = st.sidebar.radio("Selecciona Módulo Activo:", ["🤖 Auditoría Integral (Planos + Catálogos)", "📐 Auditoría Exclusiva de Planos", "🔍 Comparador Visual Geométrico (Overlay)", "🛡️ Defensa de Auditoría (Contra-Revisión)"])
+modulo_activo = st.sidebar.radio("Selecciona Módulo Activo:", ["🤖 Auditoría Integral (Planos + Catálogos)", "📐 Auditoría Exclusiva de Planos"])
 st.sidebar.markdown("---")
 st.sidebar.subheader("Información del Proyecto")
 project_name = st.sidebar.text_input("Bautiza el Proyecto (Requerido)", placeholder="Ej. Almacén Adquisiciones")
 
-# Lógica del Folder Picker nativo de Windows
-def select_folder():
-    root = tk.Tk()
-    root.withdraw()
-    root.wm_attributes('-topmost', 1)
-    folder_path = filedialog.askdirectory(master=root)
-    root.destroy()
-    return folder_path
-
-if 'target_folder' not in st.session_state:
-    st.session_state.target_folder = ""
-
-if st.sidebar.button("📁 Seleccionar Carpeta Destino"):
-    selected = select_folder()
-    if selected:
-        st.session_state.target_folder = selected
-
-if st.session_state.target_folder:
-    st.sidebar.success(f"Destino: {st.session_state.target_folder}")
-else:
-    st.sidebar.info("Destino: Carpeta por defecto (Proyectos_Auditados)")
+st.sidebar.info("Modo Nube: Los archivos se procesarán en memoria.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Parámetros del Proyecto")
@@ -230,44 +334,6 @@ def call_gemini(api_key, pdf_texts, excel_texts, reglas, tipo_auditoria="integra
         return json.loads(raw_text)
     except Exception as e:
         st.error(f"Error parseando JSON de Gemini: {e}")
-        return []
-
-def call_gemini_defensa(api_key, pdf_obs, pdf_proy, exc_proy):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-3.5-flash')
-    
-    prompt = f"""
-    Eres un Perito Estructural Defensor. El cliente/revisor ha rechazado o hecho observaciones al proyecto.
-    
-    OBSERVACIONES DEL CLIENTE (Dictamen de Rechazo):
-    {pdf_obs}
-    
-    DATOS DEL PROYECTO (Planos PDF):
-    {pdf_proy}
-    
-    DATOS DEL PROYECTO (Catálogos Excel):
-    {exc_proy}
-    
-    Tu tarea es cruzar cada observación del cliente contra los datos del proyecto para encontrar "Falsos Positivos" (lugares donde el cliente se equivocó y la información sí existe o es correcta en el proyecto).
-    
-    DEBES RESPONDER ÚNICAMENTE CON UN JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA:
-    [
-        {{
-            "observacion_del_cliente": "Resumen de lo que observó el cliente",
-            "estatus": "Falso Positivo" o "Observación Válida",
-            "argumento_defensa": "Tu argumento técnico legal para defender el proyecto, o tu confirmación de que efectivamente falta",
-            "ubicacion_prueba": "Nombre del archivo y texto o celda exacta donde está la evidencia (si aplica)"
-        }}
-    ]
-    Si no hay observaciones, responde [].
-    """
-    
-    response = model.generate_content(prompt)
-    try:
-        raw_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw_text)
-    except Exception as e:
-        st.error(f"Error parseando JSON de Gemini (Defensa): {e}")
         return []
 
 def generate_advanced_excel_report(gemini_results, pdf_files):
@@ -465,183 +531,39 @@ if modulo_activo in ["🤖 Auditoría Integral (Planos + Catálogos)", "📐 Aud
                     df_report = pd.DataFrame(gemini_results)
                     st.dataframe(df_report)
                     
-                    # 3. Generar Salidas (Marcado) y Guardar Localmente
+                    # 3. Generar Salidas (Marcado) y Guardar en Memoria (Cloud-Ready)
                     st.subheader("📥 Sistema de Archivos y Descarga")
                     
-                    # Crear estructura de carpetas
-                    base_dir = st.session_state.target_folder if st.session_state.target_folder else "Proyectos_Auditados"
-                    project_dir = os.path.join(base_dir, project_name)
-                    os.makedirs(project_dir, exist_ok=True)
-                    
-                    # Guardar Reporte Maestro Avanzado con Imágenes
-                    master_path = os.path.join(project_dir, f"Reporte_Maestro_{project_name}.xlsx")
-                    try:
-                        excel_bytes = generate_advanced_excel_report(gemini_results, pdf_files)
-                        with open(master_path, "wb") as f:
-                            f.write(excel_bytes)
-                    except Exception as e:
-                        st.error(f"Error generando reporte fotográfico: {e}")
-                        df_report.to_excel(master_path, index=False)
-                    
-                    # Guardar PDFs marcados
-                    if pdf_files:
-                        for pdf in pdf_files:
-                            marked_pdf_bytes = mark_pdf(pdf, gemini_results)
-                            pdf_path = os.path.join(project_dir, f"[REVISADO]_{pdf.name}")
-                            with open(pdf_path, "wb") as f:
-                                f.write(marked_pdf_bytes)
-                                
-                    # Guardar Excels marcados
-                    if excel_files:
-                        for exc in excel_files:
-                            marked_excel_bytes = mark_excel(exc, gemini_results)
-                            exc_path = os.path.join(project_dir, f"[REVISADO]_{exc.name}")
-                            with open(exc_path, "wb") as f:
-                                f.write(marked_excel_bytes)
-                    
-                    # Comprimir carpeta en ZIP
-                    zip_path_base = os.path.join(base_dir, f"Auditoria_{project_name}")
-                    shutil.make_archive(zip_path_base, 'zip', project_dir)
-                    final_zip_path = f"{zip_path_base}.zip"
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                        # Guardar Reporte Maestro Avanzado con Imágenes
+                        try:
+                            excel_bytes = generate_advanced_excel_report(gemini_results, pdf_files)
+                            zip_file.writestr(f"Reporte_Maestro_{project_name}.xlsx", excel_bytes)
+                        except Exception as e:
+                            st.error(f"Error generando reporte fotográfico: {e}")
+                            
+                        # Guardar PDFs marcados
+                        if pdf_files:
+                            for pdf in pdf_files:
+                                marked_pdf_bytes = mark_pdf(pdf, gemini_results)
+                                zip_file.writestr(f"[REVISADO]_{pdf.name}", marked_pdf_bytes)
+                                    
+                        # Guardar Excels marcados
+                        if excel_files:
+                            for exc in excel_files:
+                                marked_excel_bytes = mark_excel(exc, gemini_results)
+                                zip_file.writestr(f"[REVISADO]_{exc.name}", marked_excel_bytes)
                     
                     # Notificar al usuario
-                    st.success(f"Archivos guardados físicamente en tu computadora en: `{os.path.abspath(project_dir)}`")
+                    st.success("✅ Documentos procesados y empaquetados exitosamente.")
                     
                     # Botón único de descarga ZIP
-                    with open(final_zip_path, "rb") as f:
-                        st.download_button(
-                            label=f"📦 Descargar Proyecto Completo (.zip)",
-                            data=f.read(),
-                            file_name=f"Auditoria_{project_name}.zip",
-                            mime="application/zip",
-                            use_container_width=True
-                        )
-
-# ==========================================
-# MÓDULO 2: COMPARADOR VISUAL (OVERLAY PDF)
-# ==========================================
-elif modulo_activo == "🔍 Comparador Visual Geométrico (Overlay)":
-    st.subheader("🔍 Comparador Visual de Planos (Súper-Visión)")
-    st.markdown("Sube dos planos para compararlos. Lo **antiguo o demolido** aparecerá en **ROJO**, y lo **nuevo o construido** en **VERDE**.")
-    
-    colA, colB = st.columns(2)
-    with colA:
-        st.info("🔴 Plano Base / Antiguo / Planta Baja")
-        pdf_old = st.file_uploader("Sube el primer plano PDF", type=["pdf"], key="old")
-    with colB:
-        st.success("🟢 Plano de Revisión / Nuevo / Planta Alta")
-        pdf_new = st.file_uploader("Sube el segundo plano PDF", type=["pdf"], key="new")
-        
-    if st.button("🔮 Generar Superposición Visual", use_container_width=True):
-        if pdf_old and pdf_new:
-            with st.spinner("Procesando píxeles y alineando geometría..."):
-                try:
-                    doc_old = fitz.open(stream=pdf_old.read(), filetype="pdf")
-                    doc_new = fitz.open(stream=pdf_new.read(), filetype="pdf")
-                    
-                    # Convertir a imagen de alta calidad
-                    pix_old = doc_old[0].get_pixmap(dpi=200)
-                    pix_new = doc_new[0].get_pixmap(dpi=200)
-                    
-                    img_old = Image.frombytes("RGB", [pix_old.width, pix_old.height], pix_old.samples)
-                    img_new = Image.frombytes("RGB", [pix_new.width, pix_new.height], pix_new.samples)
-                    
-                    # Redimensionar el nuevo al viejo para garantizar superposición exacta
-                    img_new = img_new.resize(img_old.size)
-                    
-                    # Convertir a arrays grises
-                    arr_old = np.array(img_old.convert("L"))
-                    arr_new = np.array(img_new.convert("L"))
-                    
-                    h, w = arr_old.shape
-                    out = np.ones((h, w, 3), dtype=np.uint8) * 255
-                    
-                    threshold = 200
-                    old_dark = arr_old < threshold
-                    new_dark = arr_new < threshold
-                    
-                    # Pixeles sin cambio (Ambos oscuros) -> Negro
-                    out[old_dark & new_dark] = [0, 0, 0]
-                    # Pixeles demolidos o antiguos (Solo el viejo es oscuro) -> Rojo
-                    out[old_dark & ~new_dark] = [255, 0, 0]
-                    # Pixeles nuevos o agregados (Solo el nuevo es oscuro) -> Verde
-                    out[~old_dark & new_dark] = [0, 200, 0]
-                    
-                    result_img = Image.fromarray(out)
-                    
-                    st.image(result_img, caption="Resultado de Superposición Visual", use_container_width=True)
-                    
-                    # Opción de descarga
-                    buf = io.BytesIO()
-                    result_img.save(buf, format="PNG")
-                    byte_im = buf.getvalue()
                     st.download_button(
-                        label="📥 Descargar Imagen Resultante",
-                        data=byte_im,
-                        file_name="Comparacion_Visual_Overlay.png",
-                        mime="image/png",
-                        use_container_width=True
-                    )
-                except Exception as e:
-                    st.error(f"Error procesando los PDFs: {e}")
-        else:
-            st.warning("⚠️ Sube ambos planos (Antiguo y Nuevo) para poder superponerlos.")
-
-# ==========================================
-# MÓDULO 3: DEFENSA DE AUDITORÍA
-# ==========================================
-elif modulo_activo == "🛡️ Defensa de Auditoría (Contra-Revisión)":
-    st.subheader("🛡️ Abogado Defensor Técnico (Contra-Revisión)")
-    st.markdown("Sube el dictamen de rechazo y tu proyecto. La IA buscará **Falsos Positivos** en las observaciones del cliente para ayudarte a defender tu trabajo.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.error("📄 Dictamen de Observaciones (Rechazo)")
-        pdf_obs_file = st.file_uploader("Sube el Oficio del Cliente", type=["pdf"])
-    with col2:
-        st.success("📁 Tu Proyecto (Defensa)")
-        pdf_proy_files = st.file_uploader("Sube los Planos (PDF)", type=["pdf"], accept_multiple_files=True)
-        exc_proy_files = st.file_uploader("Sube los Catálogos (Excel)", type=["xlsx"], accept_multiple_files=True)
-
-    if st.button("⚔️ Ejecutar Defensa Legal/Técnica", use_container_width=True):
-        if not api_key:
-            st.error("⚠️ Por favor ingresa tu API Key de Gemini en el panel lateral.")
-        elif not pdf_obs_file or (not pdf_proy_files and not exc_proy_files):
-            st.warning("⚠️ Sube el dictamen y al menos un archivo del proyecto.")
-        else:
-            with st.spinner("⚖️ Analizando el juicio... cruzando pruebas del cliente con el proyecto..."):
-                # Extraer texto dictamen
-                obs_text = extract_pdf_text(pdf_obs_file)
-                
-                # Extraer texto proyecto
-                proy_pdf_texts = ""
-                if pdf_proy_files:
-                    for pdf in pdf_proy_files:
-                        proy_pdf_texts += f"--- {pdf.name} ---\n" + extract_pdf_text(pdf) + "\n\n"
-                    
-                proy_exc_texts = ""
-                if exc_proy_files:
-                    for exc in exc_proy_files:
-                        proy_exc_texts += f"--- {exc.name} ---\n" + extract_excel_data(exc) + "\n\n"
-                    
-                # IA
-                defensa_results = call_gemini_defensa(api_key, obs_text, proy_pdf_texts, proy_exc_texts)
-                
-                if not defensa_results:
-                    st.info("La IA no pudo estructurar argumentos de defensa con la información proporcionada.")
-                else:
-                    st.success(f"⚖️ Se generaron {len(defensa_results)} puntos de contra-revisión.")
-                    df_defensa = pd.DataFrame(defensa_results)
-                    st.dataframe(df_defensa)
-                    
-                    # Guardar excel de defensa
-                    buf = io.BytesIO()
-                    df_defensa.to_excel(buf, index=False)
-                    st.download_button(
-                        label="📥 Descargar Reporte de Defensa (.xlsx)",
-                        data=buf.getvalue(),
-                        file_name="Reporte_Defensa_Tecnica.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        label=f"📦 Descargar Proyecto Completo (.zip)",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"Auditoria_{project_name}.zip",
+                        mime="application/zip",
                         use_container_width=True
                     )
 
